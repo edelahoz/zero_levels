@@ -1,12 +1,6 @@
 #%%
 #!/usr/bin/env python3
 
-
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src"))
-
 import numpy as np
 import healpy as hp
 from ..src.ttplots import TTplots
