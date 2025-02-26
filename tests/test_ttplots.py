@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src
 
 import numpy as np
 import healpy as hp
-from ttplots import TTplots
+from ..src.ttplots import TTplots
 #%%
 
 def generate_map(nside, monopole_value, dipole_amplitude, dipole_direction):
