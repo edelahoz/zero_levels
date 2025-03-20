@@ -11,7 +11,8 @@ class TTplots():
 
 
     def __init__(self, nside: int, nside_cluster: int = None,
-                 clusters: List[NDArray[np.int32]] = None) -> None:
+                 clusters: List[NDArray[np.int32]] = None, 
+                 mask: NDArray[bool] = None) -> None:
 
         self.nside = nside
 
@@ -19,7 +20,7 @@ class TTplots():
             if nside_cluster is None:
                 raise ValueError("Either nside_cluster or clusters has to be provided")
             else:
-                clusters = self.get_HEALPix_super_clusters(nside, nside_cluster)
+                clusters = self.get_HEALPix_super_clusters(nside, nside_cluster, mask=mask)
 
         self.n_clusters = len(clusters)
         self.clusters = clusters
@@ -72,14 +73,19 @@ class TTplots():
         
         return ind_pixels if out_nest else hp.nest2ring(nside_out, ind_pixels)
 
-    def get_HEALPix_super_clusters(self, nside: int, super_nside: int):
+    def get_HEALPix_super_clusters(self, nside: int, super_nside: int, 
+                                   mask: NDArray[bool] = None) -> List[NDArray[np.int32]]:
         clusters = []
+        idx_mask = np.argwhere(mask).flatten() if mask is not None else None
         
         for ipix in np.arange(12 * super_nside * super_nside):
-            clusters.append(self.get_children_pixels(
+            idx_cluster = self.get_children_pixels(
                 ipix, nside_in=super_nside, nside_out=nside,
             )
-        )
+            if mask is not None:
+                idx_cluster = idx_cluster[np.in1d(idx_cluster, idx_mask)]
+
+            if idx_cluster.size !=0: clusters.append(idx_cluster)
 
         return clusters
 
