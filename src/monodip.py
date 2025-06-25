@@ -7,14 +7,134 @@ from typing import List, Union, Dict
 from numpy.typing import NDArray
 
 
-class TTplots():
+class MonoDip():
+
+    def __init__(self, nside: int) -> None:
+
+        self.nside = nside
+        self.T_array = None
+
+    def get_templates(self):
+        if self.T_array is None:
+            
+            Npix = 12 * self.nside * self.nside
+
+            theta, phi = hp.pix2ang(
+                self.nside, 
+                np.arange(Npix), 
+                lonlat=False
+            )
+
+            T_array = np.vstack([
+                np.ones(Npix), 
+                np.cos(phi) * np.sin(theta),
+                np.sin(phi) * np.sin(theta),
+                np.cos(theta)]).T
+            
+            self.T_array = T_array
+        return self.T_array
+
+    def remove_mono_dipole(self, maps: NDArray[np.float64], 
+                           mono_dipole: NDArray[np.float64],
+                           **kwargs) -> NDArray[np.float64]:
+        
+        corrected_maps = np.zeros(maps.shape)
+        vecs = np.array(hp.pix2vec(self.nside, np.arange(12 * self.nside ** 2)))
+
+        for i, (m, md) in enumerate(zip(maps, mono_dipole)):
+            monopole = md[0]
+                
+            dipole_amp = np.sqrt(np.sum(md[1: 4] ** 2))
+            dipole_direction = md[1: 4] / dipole_amp
+            dipole = dipole_amp * np.dot(dipole_direction, vecs)
+                
+            corrected_maps[i] = m - monopole - dipole
+
+        return corrected_maps
+
+
+    def dep_remove_mono_dipole(self, maps: NDArray[np.float64], 
+                           mono_dipole: NDArray[np.float64],
+                           fixed_pars: Dict = None,) -> NDArray[np.float64]:
+        
+        corrected_maps = np.zeros(maps.shape)
+        vecs = hp.pix2vec(self.nside, np.arange(12 * self.nside ** 2))
+
+        aux_idx = 0
+        for i, m in enumerate(maps):
+            if (fixed_pars is not None) and (i in fixed_pars.keys()):
+                par = fixed_pars[i]
+                if par == "mono":
+                    corrected_maps[i] = self.remove_dipoles(
+                        m, mono_dipole[i * 4 - aux_idx : (i + 1) * 4 - 1 - aux_idx]
+                    )
+                    aux_idx += 1
+                elif par == "dip":
+                    corrected_maps[i] = self.remove_monopoles(
+                        m, mono_dipole[i * 4 - aux_idx]
+                    )
+                    aux_idx += 3
+            else:
+                monopole = mono_dipole[i * 4 - aux_idx]
+                
+                dipole_amp = np.sqrt(np.sum(mono_dipole[i * 4 + 1 - aux_idx: (i + 1) * 4 - aux_idx] ** 2 ))
+                dipole_direction = mono_dipole[i * 4 + 1 - aux_idx : (i + 1) * 4 - aux_idx] / dipole_amp
+                dipole = dipole_amp * np.dot(dipole_direction, vecs)
+                
+                corrected_maps[i] = m - monopole - dipole
+
+        return corrected_maps
+    
+    def remove_monopoles(self, maps: NDArray[np.float64], 
+                        monopoles: Union[float, NDArray[np.float64]]
+                        ) -> NDArray[np.float64]:
+        
+        if isinstance(monopoles, (list, tuple, np.ndarray)):
+            assert monopoles.size == maps.shape[0], (
+                "The number of monopoles needs to equal the number of maps"
+                )
+            monopoles = monopoles[..., np.newaxis]
+        return maps - monopoles
+    
+    def remove_dipoles(self, maps: NDArray[np.float64], 
+                       dipoles: NDArray[np.float64]) -> NDArray[np.float64]:
+        
+        assert dipoles.shape[-1] == 3, (
+            "Dipoles should be in (dx, dy, dz) format"
+        )
+
+        vecs = hp.pix2vec(self.nside, np.arange(12 * self.nside ** 2))
+        corrected_maps = maps.copy()
+
+        if dipoles.ndim == 2:
+            assert dipoles.shape[0] == maps.shape[0], (
+                "The number of dipoles needs to equal the number of maps"
+                )
+            
+            for i, (m, dipole) in enumerate(zip(maps, dipoles)):
+                dipole_amp = np.sqrt(np.sum(dipole ** 2 ))
+                dipole_direction = dipole / dipole_amp
+                dipole_map = dipole_amp * np.dot(dipole_direction, vecs)
+
+                corrected_maps[i] = m - dipole_map
+        else:
+            dipole_amp = np.sqrt(np.sum(dipoles ** 2 ))
+            dipole_direction = dipoles / dipole_amp
+            dipole_map = dipole_amp * np.dot(dipole_direction, vecs)
+
+            corrected_maps = maps - dipole_map
+        
+        return corrected_maps
+
+
+class TTplots(MonoDip):
 
 
     def __init__(self, nside: int, nside_cluster: int = None,
                  clusters: List[NDArray[np.int32]] = None, 
                  mask: NDArray[bool] = None) -> None:
 
-        self.nside = nside
+        super().__init__(nside)
 
         if clusters is None:
             if nside_cluster is None:
@@ -22,11 +142,11 @@ class TTplots():
             else:
                 clusters = self.get_HEALPix_super_clusters(nside, nside_cluster, mask=mask)
 
+        clusters = [cluster for cluster in clusters if cluster.size > 1]
         self.n_clusters = len(clusters)
         self.clusters = clusters
-
         self.T_array_clusters = None
-        self.T_array = None
+        
 
     @staticmethod
     def get_children_pixels(pix: int, nside_in: int, nside_out: int, 
@@ -135,25 +255,7 @@ class TTplots():
 
         return self.T_array_clusters
     
-    def get_templates(self):
-        if self.T_array is None:
-            
-            Npix = 12 * self.nside * self.nside
 
-            theta, phi = hp.pix2ang(
-                self.nside, 
-                np.arange(Npix), 
-                lonlat=False
-            )
-
-            T_array = np.vstack([
-                np.ones(Npix), 
-                np.cos(phi) * np.sin(theta),
-                np.sin(phi) * np.sin(theta),
-                np.cos(theta)]).T
-            
-            self.T_array = T_array
-        return self.T_array
 
     def calculate_mono_dipole(self, maps: NDArray[np.float64],
                               fixed_pars: Dict = None) -> NDArray[np.float64]:
@@ -201,78 +303,6 @@ class TTplots():
         x = np.linalg.inv(A.T @ A) @ A.T @ b.T
         return x[:, 0]
     
-    def remove_mono_dipole(self, maps: NDArray[np.float64], 
-                           mono_dipole: NDArray[np.float64],
-                           fixed_pars: Dict = None,) -> NDArray[np.float64]:
-        
-        corrected_maps = np.zeros(maps.shape)
-        vecs = hp.pix2vec(self.nside, np.arange(12 * self.nside ** 2))
-
-        aux_idx = 0
-        for i, m in enumerate(maps):
-            if (fixed_pars is not None) and (i in fixed_pars.keys()):
-                par = fixed_pars[i]
-                if par == "mono":
-                    corrected_maps[i] = self.remove_dipoles(
-                        m, mono_dipole[i * 4 - aux_idx : (i + 1) * 4 - 1 - aux_idx]
-                    )
-                    aux_idx += 1
-                elif par == "dip":
-                    corrected_maps[i] = self.remove_monopoles(
-                        m, mono_dipole[i * 4 - aux_idx]
-                    )
-                    aux_idx += 3
-            else:
-                monopole = mono_dipole[i * 4 - aux_idx]
-                
-                dipole_amp = np.sqrt(np.sum(mono_dipole[i * 4 + 1 - aux_idx: (i + 1) * 4 - aux_idx] ** 2 ))
-                dipole_direction = mono_dipole[i * 4 + 1 - aux_idx : (i + 1) * 4 - aux_idx] / dipole_amp
-                dipole = dipole_amp * np.dot(dipole_direction, vecs)
-                
-                corrected_maps[i] = m - monopole - dipole
-
-        return corrected_maps
-    
-    def remove_monopoles(self, maps: NDArray[np.float64], 
-                        monopoles: Union[float, NDArray[np.float64]]
-                        ) -> NDArray[np.float64]:
-        
-        if isinstance(monopoles, (list, tuple, np.ndarray)):
-            assert monopoles.size == maps.shape[0], (
-                "The number of monopoles needs to equal the number of maps"
-                )
-            monopoles = monopoles[..., np.newaxis]
-        return maps - monopoles
-    
-    def remove_dipoles(self, maps: NDArray[np.float64], 
-                       dipoles: NDArray[np.float64]) -> NDArray[np.float64]:
-        
-        assert dipoles.shape[-1] == 3, (
-            "Dipoles should be in (dx, dy, dz) format"
-        )
-
-        vecs = hp.pix2vec(self.nside, np.arange(12 * self.nside ** 2))
-        corrected_maps = maps.copy()
-
-        if dipoles.ndim == 2:
-            assert dipoles.shape[0] == maps.shape[0], (
-                "The number of dipoles needs to equal the number of maps"
-                )
-            
-            for i, (m, dipole) in enumerate(zip(maps, dipoles)):
-                dipole_amp = np.sqrt(np.sum(dipole ** 2 ))
-                dipole_direction = dipole / dipole_amp
-                dipole_map = dipole_amp * np.dot(dipole_direction, vecs)
-
-                corrected_maps[i] = m - dipole_map
-        else:
-            dipole_amp = np.sqrt(np.sum(dipoles ** 2 ))
-            dipole_direction = dipoles / dipole_amp
-            dipole_map = dipole_amp * np.dot(dipole_direction, vecs)
-
-            corrected_maps = maps - dipole_map
-        
-        return corrected_maps
         
     
 
@@ -303,9 +333,10 @@ class TTplots():
             iter_mono_dipole = self.calculate_mono_dipole(maps, fixed_pars=fixed_pars)
             mono_dipole.append(iter_mono_dipole)
 
+
             total_mono_dipole += iter_mono_dipole
 
-            maps = self.remove_mono_dipole(maps, iter_mono_dipole, fixed_pars=fixed_pars)
+            maps = self.dep_remove_mono_dipole(maps, iter_mono_dipole, fixed_pars=fixed_pars)
 
             criterion = np.sum(
                 np.abs(mono_dipole[-1] - mono_dipole[-2]).sum() 
@@ -314,8 +345,16 @@ class TTplots():
             iter += 1
         return total_mono_dipole, np.array(mono_dipole[1:])
     
-    def template_fitting(self, m: NDArray[np.float64],
-                         sigma: NDArray[np.float64],
+
+
+class TemplateFitting(MonoDip):
+
+    def __init__(self, nside: int) -> None:
+
+        super.__init__(nside)
+    
+
+    def template_fitting(self, sigma: NDArray[np.float64],
                          template_maps: NDArray[np.float64],
                         ) -> NDArray[np.float64]:
         
