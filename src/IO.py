@@ -2,7 +2,7 @@
 
 import sqlite3
 import json
-
+import pandas as pd
 
 def create_tables(db_name: str):
     """Creates the required tables if they don't exist."""
@@ -152,5 +152,6 @@ def read_results(db_name: str, maps, selected_map=None, last_iteration_only=Fals
                 last_iteration = iteration
             print(f"  {map_name}: Monopole={monopole}, Dipole=({dx}, {dy}, {dz})")
         
-        return results
+        df = pd.DataFrame(results, columns=["iteration", "map_name", "monopole", "dipole_ax", "dipole_ay", "dipole_az"])
+        return df
 
