@@ -9,24 +9,27 @@ from numpy.typing import NDArray
 
 class MonoDip():
 
-    def __init__(self, nside: int) -> None:
+    def __init__(self, nside: int, mask: NDArray[np.float64] = None) -> None:
 
         self.nside = nside
         self.T_array = None
+        self.mask = mask
 
     def get_templates(self):
         if self.T_array is None:
-            
-            Npix = 12 * self.nside * self.nside
+            if self.mask is not None:
+                pixels = np.argwhere(self.mask != 0).flatten()
+            else:
+                pixels = np.arange(12 * self.nside ** 2)
 
             theta, phi = hp.pix2ang(
                 self.nside, 
-                np.arange(Npix), 
+                pixels, 
                 lonlat=False
             )
 
             T_array = np.vstack([
-                np.ones(Npix), 
+                np.ones(pixels.size), 
                 np.cos(phi) * np.sin(theta),
                 np.sin(phi) * np.sin(theta),
                 np.cos(theta)]).T
@@ -349,19 +352,17 @@ class TTplots(MonoDip):
 
 class TemplateFitting(MonoDip):
 
-    def __init__(self, nside: int) -> None:
+    def __init__(self, nside: int, mask: NDArray[np.float64] = None) -> None:
 
-        super.__init__(nside)
-    
+        super().__init__(nside, mask=mask)
 
-    def template_fitting(self, sigma: NDArray[np.float64],
+
+    def template_fitting(self, m: NDArray[np.float64], sigma: NDArray[np.float64],
                          template_maps: NDArray[np.float64],
                         ) -> NDArray[np.float64]:
         
         T_monodip = self.get_templates()
         T_array = np.hstack([T_monodip, template_maps.T])
 
-        inv_N = np.diag(1 / sigma ** 2)
-
-        z = np.linalg.inv(T_array.T @ inv_N @ T_array) @ T_array.T @ inv_N @ m [..., np.newaxis]
+        z = np.linalg.inv((T_array.T / (sigma ** 2)) @ T_array) @ T_array.T @ ( m / (sigma ** 2)) [..., np.newaxis]
         return z
