@@ -1,9 +1,15 @@
 #%%
 #!/usr/bin/env python3
 
+import os
+import sys
+
 import numpy as np
 import healpy as hp
-from ..src.ttplots import TTplots
+
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), "src"))
+
+from zero_levels import TTplots
 #%%
 
 def generate_map(nside, monopole_value, dipole_amplitude, dipole_direction):

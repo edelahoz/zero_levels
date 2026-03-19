@@ -2,19 +2,13 @@
 #!/usr/bin/env python3
 
 import os
+import sys
+
 import numpy as np
 
-try:
-    from ..src import IO
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), "src"))
 
-except ImportError:
-    import sys
-    
-    sys.path.append(
-        os.path.dirname(os.path.dirname(__file__))
-    )
-    
-    import src.IO as IO
+from zero_levels import IO
 
 db_name = "test_io.db"
 
