@@ -41,3 +41,7 @@ If one map has a fixed monopole or dipole, pass `fixed_pars`, for example `fixed
 ```bash
 pytest
 ```
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See `LICENSE`.
