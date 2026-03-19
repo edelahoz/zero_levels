@@ -200,6 +200,13 @@ class TTplots(MonoDip):
                                    mask: NDArray[bool] = None) -> List[NDArray[np.int32]]:
         clusters = []
         idx_mask = np.argwhere(mask).flatten() if mask is not None else None
+
+        if super_nside == 0:
+            if mask is not None:
+                clusters.append(idx_mask)
+            else:
+                clusters.append(np.arange(12 * nside * nside))
+            return clusters
         
         for ipix in np.arange(12 * super_nside * super_nside):
             idx_cluster = self.get_children_pixels(
@@ -211,6 +218,13 @@ class TTplots(MonoDip):
             if idx_cluster.size !=0: clusters.append(idx_cluster)
 
         return clusters
+    
+    @staticmethod
+    def simple_calculate_slope_intercept(x, y):
+
+        m = np.sum((x - x.mean()) * (y - y.mean())) / np.sum((x - x.mean())**2)
+        b = y.mean() - m * x.mean()
+        return m, b
 
     def calculate_slopes_intercepts(self, maps: NDArray[np.float64]):
         Nmaps, Npix = maps.shape
@@ -218,22 +232,32 @@ class TTplots(MonoDip):
         slopes = np.zeros(Nmaps - 1)
         intercepts = np.zeros(Nmaps - 1)
 
-        aux_idx = np.triu_indices(Npix, k=1)
-        
-        pairwise_diff1 = np.subtract.outer(
-                maps[0], maps[0]
-                )[aux_idx]
-        
-        for idx in np.arange(Nmaps -1):
-            pairwise_diff2 = np.subtract.outer(
-                maps[idx + 1], maps[idx + 1]
-                )[aux_idx]
+        if Npix > 15000:
+            print("Using simple linear regression for slope and intercept calculation. Should be checked.")
+            # Use simple linear regression because of memory demands
+            for idx in np.arange(Nmaps -1):
+                m, b = self.simple_calculate_slope_intercept(
+                    maps[idx], maps[idx+1]
+                )
+                slopes[idx] = m
+                intercepts[idx] = b
+        else:
+            aux_idx = np.triu_indices(Npix, k=1)
+                
+            pairwise_diff1 = np.subtract.outer(
+                    maps[0], maps[0]
+                    )[aux_idx]
             
-            slopes[idx] = np.median(pairwise_diff2[pairwise_diff1 != 0] / pairwise_diff1[pairwise_diff1 != 0])
-            intercepts[idx] = np.median(maps[idx + 1] - slopes[idx] * maps[idx])
+            for idx in np.arange(Nmaps -1):
+                pairwise_diff2 = np.subtract.outer(
+                    maps[idx + 1], maps[idx + 1]
+                    )[aux_idx]
+                
+                slopes[idx] = np.median(pairwise_diff2[pairwise_diff1 != 0] / pairwise_diff1[pairwise_diff1 != 0])
+                intercepts[idx] = np.median(maps[idx + 1] - slopes[idx] * maps[idx])
 
-            pairwise_diff1 = pairwise_diff2.copy()
-        
+                pairwise_diff1 = pairwise_diff2.copy()
+            
         return slopes, intercepts
     
 
@@ -264,6 +288,12 @@ class TTplots(MonoDip):
                               fixed_pars: Dict = None) -> NDArray[np.float64]:
         
         N_maps = len(maps)
+
+        # Monopole and Dipole Templates
+        T_array = self.get_clusters_templates()
+        n_temp = T_array.shape[-1]
+
+        assert self.n_clusters >= n_temp * N_maps, "Number of clusters must be larger than number of parameters to fit"
         
         # Calculate slopes (a) and intercepts (b)
         a = np.zeros((N_maps - 1, self.n_clusters))
@@ -277,9 +307,7 @@ class TTplots(MonoDip):
             a[:, i] = s_cluster
             b[:, i] = i_cluster
 
-        # Monopole and Dipole Templates
-        T_array = self.get_clusters_templates()
-        n_temp = T_array.shape[-1]
+        
 
 
         # Linear system A x = b
