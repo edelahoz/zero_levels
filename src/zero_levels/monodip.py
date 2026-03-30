@@ -9,11 +9,14 @@ from numpy.typing import NDArray
 
 class MonoDip():
 
-    def __init__(self, nside: int, mask: NDArray[np.float64] = None) -> None:
+    def __init__(
+            self, nside: int, mask: NDArray[np.float64] = None, 
+            calculate_dipole: bool =True) -> None:
 
         self.nside = nside
         self.T_array = None
         self.mask = mask
+        self.calculate_dipole = calculate_dipole
 
     def get_templates(self):
         if self.T_array is None:
@@ -22,17 +25,20 @@ class MonoDip():
             else:
                 pixels = np.arange(12 * self.nside ** 2)
 
-            theta, phi = hp.pix2ang(
-                self.nside, 
-                pixels, 
-                lonlat=False
-            )
+            if self.calculate_dipole:
+                theta, phi = hp.pix2ang(
+                    self.nside, 
+                    pixels, 
+                    lonlat=False
+                )
 
-            T_array = np.vstack([
-                np.ones(pixels.size), 
-                np.cos(phi) * np.sin(theta),
-                np.sin(phi) * np.sin(theta),
-                np.cos(theta)]).T
+                T_array = np.vstack([
+                    np.ones(pixels.size), 
+                    np.cos(phi) * np.sin(theta),
+                    np.sin(phi) * np.sin(theta),
+                    np.cos(theta)]).T
+            else:
+                T_array = np.ones((1, pixels.size))
             
             self.T_array = T_array
         return self.T_array
@@ -56,37 +62,7 @@ class MonoDip():
         return corrected_maps
 
 
-    def dep_remove_mono_dipole(self, maps: NDArray[np.float64], 
-                           mono_dipole: NDArray[np.float64],
-                           fixed_pars: Dict = None,) -> NDArray[np.float64]:
-        
-        corrected_maps = np.zeros(maps.shape)
-        vecs = hp.pix2vec(self.nside, np.arange(12 * self.nside ** 2))
-
-        aux_idx = 0
-        for i, m in enumerate(maps):
-            if (fixed_pars is not None) and (i in fixed_pars.keys()):
-                par = fixed_pars[i]
-                if par == "mono":
-                    corrected_maps[i] = self.remove_dipoles(
-                        m, mono_dipole[i * 4 - aux_idx : (i + 1) * 4 - 1 - aux_idx]
-                    )
-                    aux_idx += 1
-                elif par == "dip":
-                    corrected_maps[i] = self.remove_monopoles(
-                        m, mono_dipole[i * 4 - aux_idx]
-                    )
-                    aux_idx += 3
-            else:
-                monopole = mono_dipole[i * 4 - aux_idx]
-                
-                dipole_amp = np.sqrt(np.sum(mono_dipole[i * 4 + 1 - aux_idx: (i + 1) * 4 - aux_idx] ** 2 ))
-                dipole_direction = mono_dipole[i * 4 + 1 - aux_idx : (i + 1) * 4 - aux_idx] / dipole_amp
-                dipole = dipole_amp * np.dot(dipole_direction, vecs)
-                
-                corrected_maps[i] = m - monopole - dipole
-
-        return corrected_maps
+    
     
     def remove_monopoles(self, maps: NDArray[np.float64], 
                         monopoles: Union[float, NDArray[np.float64]]
@@ -135,9 +111,12 @@ class TTplots(MonoDip):
 
     def __init__(self, nside: int, nside_cluster: int = None,
                  clusters: List[NDArray[np.int32]] = None, 
-                 mask: NDArray[bool] = None) -> None:
+                 mask: NDArray = None, 
+                 calculate_dipole: bool =True) -> None:
 
-        super().__init__(nside)
+        super().__init__(
+            nside, mask=mask, calculate_dipole=calculate_dipole
+        )
 
         if clusters is None:
             if nside_cluster is None:
@@ -149,6 +128,7 @@ class TTplots(MonoDip):
         self.n_clusters = len(clusters)
         self.clusters = clusters
         self.T_array_clusters = None
+        
         
 
     @staticmethod
@@ -197,7 +177,7 @@ class TTplots(MonoDip):
         return ind_pixels if out_nest else hp.nest2ring(nside_out, ind_pixels)
 
     def get_HEALPix_super_clusters(self, nside: int, super_nside: int, 
-                                   mask: NDArray[bool] = None) -> List[NDArray[np.int32]]:
+                                   mask: NDArray = None) -> List[NDArray[np.int32]]:
         clusters = []
         idx_mask = np.argwhere(mask).flatten() if mask is not None else None
 
@@ -233,7 +213,6 @@ class TTplots(MonoDip):
         intercepts = np.zeros(Nmaps - 1)
 
         if Npix > 15000:
-            print("Using simple linear regression for slope and intercept calculation. Should be checked.")
             # Use simple linear regression because of memory demands
             for idx in np.arange(Nmaps -1):
                 m, b = self.simple_calculate_slope_intercept(
@@ -263,29 +242,35 @@ class TTplots(MonoDip):
 
     def get_clusters_templates(self):
         if self.T_array_clusters is None: 
-            T_array_clusters = np.zeros((self.n_clusters, 4))
-            
-            if self.T_array is not None:
-                for i, idx_cluster in enumerate(self.clusters):
-                    T_array_clusters[i] = np.mean(self.T_array[idx_cluster], axis=0)
 
+            if self.calculate_dipole:
+                T_array_clusters = np.zeros((self.n_clusters, 4))
+                
+                if self.T_array is not None:
+                    for i, idx_cluster in enumerate(self.clusters):
+                        T_array_clusters[i] = np.mean(self.T_array[idx_cluster], axis=0)
+
+                else:
+
+                    for i, idx_cluster in enumerate(self.clusters):
+                        theta, phi = hp.pix2ang(self.nside, idx_cluster, lonlat=False)
+                    
+                        T_array_clusters[i] = np.array([
+                            1, np.mean(np.cos(phi) * np.sin(theta)),
+                            np.mean(np.sin(phi) * np.sin(theta)), np.mean(np.cos(theta))
+                        ])
+                
             else:
-                for i, idx_cluster in enumerate(self.clusters):
-                    theta, phi = hp.pix2ang(self.nside, idx_cluster, lonlat=False)
-
-                    T_array_clusters[i] = np.array([
-                        1, np.mean(np.cos(phi) * np.sin(theta)),
-                        np.mean(np.sin(phi) * np.sin(theta)), np.mean(np.cos(theta))
-                    ])
+                T_array_clusters = np.ones((self.n_clusters, 1))
 
             self.T_array_clusters = T_array_clusters
-
         return self.T_array_clusters
     
 
 
     def calculate_mono_dipole(self, maps: NDArray[np.float64],
-                              fixed_pars: Dict = None) -> NDArray[np.float64]:
+                              fixed_pars: Dict = None, iter: int = None, 
+                              ext: str = "", path_si: str = None) -> NDArray[np.float64]:
         
         N_maps = len(maps)
 
@@ -307,74 +292,119 @@ class TTplots(MonoDip):
             a[:, i] = s_cluster
             b[:, i] = i_cluster
 
+        if path_si is not None:
+            np.save(f"{path_si}/slopes_iter{ext}_n{iter}.npy",  a)
+            np.save(f"{path_si}/intercepts_iter{ext}_n{iter}.npy",  b)
         
 
 
         # Linear system A x = b
         A = np.zeros(((N_maps - 1) * self.n_clusters, n_temp * N_maps))
-        
         for i, a_m in enumerate(a):
             A[i * self.n_clusters: (i + 1) * self.n_clusters, 
                 i * n_temp: (i + 2) * n_temp] = np.hstack([
                     (- a_m * T_array.T).T, T_array])
             
-        if fixed_pars is not None:
-            for idx, par in fixed_pars.items():
-                if par == "mono":
-                    A = np.delete(A, idx * n_temp, axis=1)
-                elif par == "dip":
-                    A = np.delete(A, np.arange(idx * n_temp + 1, (idx + 1) * n_temp), axis=1)
-                else:
-                    raise ValueError(
-                        f'Either mono or dip is fixed for map[{idx}] not {par}'
-                        )
+        if self.calculate_dipole:
+            if fixed_pars is not None:
+                for idx, par in fixed_pars.items():
+                    if par == "mono":
+                        A = np.delete(A, idx * n_temp, axis=1)
+                    elif par == "dip":
+                        A = np.delete(A, np.arange(idx * n_temp + 1, (idx + 1) * n_temp), axis=1)
+                    else:
+                        raise ValueError(
+                            f'Either mono or dip is fixed for map[{idx}] not {par}'
+                            )
         
         b = np.ravel(b)[np.newaxis]
 
         x = np.linalg.inv(A.T @ A) @ A.T @ b.T
         return x[:, 0]
     
+    def remove_zero_levels(self, maps: NDArray[np.float64], 
+                           zero_levels: NDArray[np.float64],
+                           fixed_pars: Dict = None,) -> NDArray[np.float64]:
+        
+        corrected_maps = np.zeros(maps.shape)
+        vecs = hp.pix2vec(self.nside, np.arange(12 * self.nside ** 2))
+        if self.calculate_dipole:
+            aux_idx = 0
+            for i, m in enumerate(maps):
+                if (fixed_pars is not None) and (i in fixed_pars.keys()):
+                    par = fixed_pars[i]
+                    if par == "mono":
+                        corrected_maps[i] = self.remove_dipoles(
+                            m, zero_levels[i * 4 - aux_idx : (i + 1) * 4 - 1 - aux_idx]
+                        )
+                        aux_idx += 1
+                    elif par == "dip":
+                        corrected_maps[i] = self.remove_monopoles(
+                            m, zero_levels[i * 4 - aux_idx]
+                        )
+                        aux_idx += 3
+                else:
+                    monopole = zero_levels[i * 4 - aux_idx]
+                    
+                    dipole_amp = np.sqrt(np.sum(zero_levels[i * 4 + 1 - aux_idx: (i + 1) * 4 - aux_idx] ** 2 ))
+                    dipole_direction = zero_levels[i * 4 + 1 - aux_idx : (i + 1) * 4 - aux_idx] / dipole_amp
+                    dipole = dipole_amp * np.dot(dipole_direction, vecs)
+                    
+                    corrected_maps[i] = m - monopole - dipole
+        else:
+            for i, m in enumerate(maps):
+                monopole = zero_levels[i]
+                        
+                corrected_maps[i] = m - monopole
+
+        return corrected_maps
+    
         
     
 
-    def calculate_mono_dipole_iter(self, maps: NDArray[np.float64], fixed_pars: Dict = None,
-                                   tolerance: float = 0.01) -> NDArray[np.float64]:
+    def calculate_zero_levels_iter(self, maps: NDArray[np.float64], fixed_pars: Dict = None,
+                                   tolerance: float = 0.01, ext: str = "", path_si: str = None) -> NDArray[np.float64]:
         
         N_maps = len(maps)
 
-        n_fixed_pars = 0
-        if fixed_pars is not None:
-            for idx, par in fixed_pars.items():
-                if par == "mono":
-                    n_fixed_pars += 1
-                elif par == "dip":
-                    n_fixed_pars += 3
-                else:
-                    raise ValueError(
-                        f'Either mono or dip is fixed for map[{idx}] not {par}'
-                        )
+        if self.calculate_dipole:
+            n_fixed_pars = 0
+            if fixed_pars is not None:
+                for idx, par in fixed_pars.items():
+                    if par == "mono":
+                        n_fixed_pars += 1
+                    elif par == "dip":
+                        n_fixed_pars += 3
+                    else:
+                        raise ValueError(
+                            f'Either mono or dip is fixed for map[{idx}] not {par}'
+                            )
         
-        total_mono_dipole = np.zeros(4 * N_maps - n_fixed_pars)
-        mono_dipole = [np.zeros(4 * N_maps - n_fixed_pars)]
+            total_zero_levels = np.zeros(4 * N_maps - n_fixed_pars)
+            zero_levels_list = [np.zeros(4 * N_maps - n_fixed_pars)]
+        else:
+            assert fixed_pars is None, "Fixing dipole is not available if calculate_dipole is False"
+            total_zero_levels = np.zeros( N_maps)
+            zero_levels_list = [np.zeros( N_maps)]
+            
         criterion = 1
-
         iter = 0
         while criterion > tolerance:
-            print(f"{iter = }: {criterion = }")
-            iter_mono_dipole = self.calculate_mono_dipole(maps, fixed_pars=fixed_pars)
-            mono_dipole.append(iter_mono_dipole)
+            iter_mono_dipole = self.calculate_mono_dipole(
+                maps, fixed_pars=fixed_pars, iter=iter, ext=ext, path_si=path_si)
+            zero_levels_list.append(iter_mono_dipole)
 
+            total_zero_levels += iter_mono_dipole
 
-            total_mono_dipole += iter_mono_dipole
-
-            maps = self.dep_remove_mono_dipole(maps, iter_mono_dipole, fixed_pars=fixed_pars)
+            maps = self.remove_zero_levels(maps, iter_mono_dipole, fixed_pars=fixed_pars)
 
             criterion = np.sum(
-                np.abs(mono_dipole[-1] - mono_dipole[-2]).sum() 
-                / np.max([np.abs(total_mono_dipole).sum(), 1e-7])
+                np.abs(zero_levels_list[-1] - zero_levels_list[-2]).sum() 
+                / np.max([np.abs(total_zero_levels).sum(), 1e-7])
             )
             iter += 1
-        return total_mono_dipole, np.array(mono_dipole[1:])
+            print(f"{iter = }: {criterion = }")
+        return total_zero_levels, np.array(zero_levels_list[1:])
     
 
 
