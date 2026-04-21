@@ -1,12 +1,7 @@
 # zero_levels
 
-`zero_levels` contains utilities to estimate and remove monopole and dipole zero levels in HEALPix maps, plus simple helpers to store iterative fit results.
+`zero_levels` contains utilities to estimate and remove monopole and dipole zero levels in HEALPix maps, plus simple helpers to store iterative fit results. Code based on [Wehus et al. 2017](https://www.aanda.org/articles/aa/full_html/2017/01/aa25659-15/aa25659-15.html). 
 
-## Layout
-
-- `src/zero_levels/monodip.py`: monopole, dipole, and TT-plot fitting tools
-- `src/zero_levels/IO.py`: SQLite-based storage helpers for iterative results
-- `tests/`: basic regression scripts
 
 ## Installation
 
@@ -35,12 +30,6 @@ corrected_maps = tt.dep_remove_mono_dipole(maps, mono_dipole)
 ```
 
 If one map has a fixed monopole or dipole, pass `fixed_pars`, for example `fixed_pars={1: "mono"}`.
-
-## Tests
-
-```bash
-pytest
-```
 
 ## License
 
