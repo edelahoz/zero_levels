@@ -3,7 +3,8 @@
 import numpy as np
 import healpy as hp
 
-from typing import List, Union, Dict
+from scipy.optimize import minimize
+from typing import List, Union, Dict, Optional
 from numpy.typing import NDArray
 
 
@@ -38,7 +39,7 @@ class MonoDip():
                     np.sin(phi) * np.sin(theta),
                     np.cos(theta)]).T
             else:
-                T_array = np.ones((1, pixels.size))
+                T_array = np.ones((pixels.size, 1))
             
             self.T_array = T_array
         return self.T_array
@@ -112,7 +113,7 @@ class TTplots(MonoDip):
     def __init__(self, nside: int, nside_cluster: int = None,
                  clusters: List[NDArray[np.int32]] = None, 
                  mask: NDArray = None, 
-                 calculate_dipole: bool =True) -> None:
+                 calculate_dipole: bool = True) -> None:
 
         super().__init__(
             nside, mask=mask, calculate_dipole=calculate_dipole
@@ -128,7 +129,6 @@ class TTplots(MonoDip):
         self.n_clusters = len(clusters)
         self.clusters = clusters
         self.T_array_clusters = None
-        
         
 
     @staticmethod
@@ -195,13 +195,12 @@ class TTplots(MonoDip):
             if mask is not None:
                 idx_cluster = idx_cluster[np.in1d(idx_cluster, idx_mask)]
 
-            if idx_cluster.size !=0: clusters.append(idx_cluster)
+            if idx_cluster.size != 0: clusters.append(idx_cluster)
 
         return clusters
     
     @staticmethod
     def simple_calculate_slope_intercept(x, y):
-
         m = np.sum((x - x.mean()) * (y - y.mean())) / np.sum((x - x.mean())**2)
         b = y.mean() - m * x.mean()
         return m, b
@@ -213,8 +212,7 @@ class TTplots(MonoDip):
         intercepts = np.zeros(Nmaps - 1)
 
         if Npix > 15000:
-            # Use simple linear regression because of memory demands
-            for idx in np.arange(Nmaps -1):
+            for idx in np.arange(Nmaps - 1):
                 m, b = self.simple_calculate_slope_intercept(
                     maps[idx], maps[idx+1]
                 )
@@ -227,7 +225,7 @@ class TTplots(MonoDip):
                     maps[0], maps[0]
                     )[aux_idx]
             
-            for idx in np.arange(Nmaps -1):
+            for idx in np.arange(Nmaps - 1):
                 pairwise_diff2 = np.subtract.outer(
                     maps[idx + 1], maps[idx + 1]
                     )[aux_idx]
@@ -251,7 +249,6 @@ class TTplots(MonoDip):
                         T_array_clusters[i] = np.mean(self.T_array[idx_cluster], axis=0)
 
                 else:
-
                     for i, idx_cluster in enumerate(self.clusters):
                         theta, phi = hp.pix2ang(self.nside, idx_cluster, lonlat=False)
                     
@@ -265,22 +262,244 @@ class TTplots(MonoDip):
 
             self.T_array_clusters = T_array_clusters
         return self.T_array_clusters
-    
 
 
-    def calculate_mono_dipole(self, maps: NDArray[np.float64],
-                              fixed_pars: Dict = None, iter: int = None, 
-                              ext: str = "", path_si: str = None) -> NDArray[np.float64]:
-        
+    def _find_coldest_pixels(
+            self,
+            maps: NDArray[np.float64],
+            n_coldest: int = 50,
+            min_separation_deg: float = 10.0,
+    ) -> List[NDArray[np.int32]]:
+        """
+        For each map, find the coldest pixels separated by at least
+        min_separation_deg degrees on the sky. Only pixels inside the
+        mask (if any) are considered.
+
+        Parameters
+        ----------
+        maps : (N_maps, N_pix)
+        n_coldest : int
+            Maximum number of cold pixels to collect per map.
+        min_separation_deg : float
+            Minimum angular separation between selected cold pixels [degrees].
+
+        Returns
+        -------
+        List of length N_maps, each element is an array of pixel indices.
+        """
+        min_sep_rad = np.radians(min_separation_deg)
+        N_maps = maps.shape[0]
+
+        if self.mask is not None:
+            valid_pixels = np.argwhere(self.mask != 0).flatten()
+        else:
+            valid_pixels = np.arange(hp.nside2npix(self.nside))
+
+        coldest_per_map = []
+
+        for i in range(N_maps):
+            sorted_idx = np.argsort(maps[i, valid_pixels])
+            sorted_pixels = valid_pixels[sorted_idx]
+
+            selected = []
+            vecs_selected = []
+
+            for pix in sorted_pixels:
+                if len(selected) >= n_coldest:
+                    break
+
+                vec = np.array(hp.pix2vec(self.nside, int(pix)))
+
+                too_close = False
+                for v in vecs_selected:
+                    cos_angle = np.clip(np.dot(vec, v), -1.0, 1.0)
+                    if cos_angle > np.cos(min_sep_rad):
+                        too_close = True
+                        break
+
+                if not too_close:
+                    selected.append(pix)
+                    vecs_selected.append(vec)
+
+            coldest_per_map.append(np.array(selected, dtype=np.int32))
+
+        return coldest_per_map
+
+
+    def _build_positivity_constraints(
+            self,
+            maps: NDArray[np.float64],
+            coldest_pixels_per_map: List[NDArray[np.int32]],
+            n_temp: int,
+            n_params_reduced: int,
+            full_to_reduced: Dict[int, int],
+            sigma_maps: Optional[NDArray[np.float64]] = None,
+            n_sigma: float = 4.0,
+    ) -> List[Dict]:
+        """
+        Build scipy-style inequality constraints enforcing that the
+        corrected map is non-negative at the coldest pixels:
+
+            map_i(p) - T_i(p)·x_i ≥ -N·σ_i(p)
+
+        Rearranged for scipy 'ineq' convention (f(x) ≥ 0):
+
+            f(x) = map_i(p) + N·σ_i(p) - T_i(p)·x_i ≥ 0
+
+        Parameters
+        ----------
+        maps : (N_maps, N_pix)
+        coldest_pixels_per_map : list of pixel index arrays, one per map
+        n_temp : number of templates per map (1 or 4)
+        n_params_reduced : total number of unknowns after fixed_pars removal
+        full_to_reduced : mapping from full column index to reduced column index
+        sigma_maps : (N_maps, N_pix) noise rms per pixel, optional.
+                     If None, constraints are hard (no relaxation).
+        n_sigma : relaxation threshold in units of sigma (default 4)
+
+        Returns
+        -------
+        List of dicts suitable for scipy.optimize.minimize(constraints=...)
+        """
+        constraints = []
+
+        for i, cold_pixels in enumerate(coldest_pixels_per_map):
+            col_start = i * n_temp
+
+            for pix in cold_pixels:
+                map_value = maps[i, pix]
+                noise_relax = 0.0
+                if sigma_maps is not None:
+                    noise_relax = n_sigma * sigma_maps[i, pix]
+
+                rhs = map_value + noise_relax
+
+                # Evaluate template at this exact pixel
+                theta, phi = hp.pix2ang(self.nside, int(pix), lonlat=False)
+                if self.calculate_dipole:
+                    t_row = np.array([
+                        1.0,
+                        np.cos(phi) * np.sin(theta),
+                        np.sin(phi) * np.sin(theta),
+                        np.cos(theta),
+                    ])
+                else:
+                    t_row = np.array([1.0])
+
+                # Map template row into reduced parameter space
+                c_vec = np.zeros(n_params_reduced)
+                for k in range(n_temp):
+                    full_col = col_start + k
+                    if full_col in full_to_reduced:
+                        c_vec[full_to_reduced[full_col]] = t_row[k]
+
+                # Closure with default args to avoid late-binding bug
+                def make_constraint(cv, r):
+                    return {
+                        "type": "ineq",
+                        "fun": lambda x, cv=cv, r=r: r - cv @ x,
+                        "jac": lambda x, cv=cv: -cv,
+                    }
+
+                constraints.append(make_constraint(c_vec, rhs))
+
+        return constraints
+
+
+    def _build_full_to_reduced_mapping(
+            self,
+            N_maps: int,
+            n_temp: int,
+            fixed_pars: Optional[Dict] = None,
+    ) -> tuple[Dict[int, int], int]:
+        """
+        Build a mapping from full parameter column indices to reduced
+        column indices after removing fixed parameters.
+
+        Returns
+        -------
+        full_to_reduced : dict mapping full index → reduced index
+        n_params_reduced : total number of free parameters
+        """
+        total_params = n_temp * N_maps
+
+        removed_cols = []
+        if fixed_pars is not None and self.calculate_dipole:
+            for idx, par in fixed_pars.items():
+                if par == "mono":
+                    removed_cols.append(idx * n_temp)
+                elif par == "dip":
+                    removed_cols.extend(
+                        list(range(idx * n_temp + 1, (idx + 1) * n_temp))
+                    )
+
+        kept_cols = [c for c in range(total_params) if c not in removed_cols]
+        n_params_reduced = len(kept_cols)
+        full_to_reduced = {full: red for red, full in enumerate(kept_cols)}
+
+        return full_to_reduced, n_params_reduced
+
+
+    def calculate_mono_dipole(
+            self,
+            maps: NDArray[np.float64],
+            fixed_pars: Optional[Dict] = None,
+            use_prior: bool = False,
+            sigma_maps: Optional[NDArray[np.float64]] = None,
+            n_sigma: float = 4.0,
+            n_coldest: int = 50,
+            min_separation_deg: float = 10.0,
+            iter: int = None,
+            ext: str = "",
+            path_si: str = None,
+    ) -> NDArray[np.float64]:
+        """
+        Calculate monopole (and optionally dipole) zero levels using the
+        TT-plot linear system. Optionally imposes a positivity prior on
+        the corrected maps at the coldest sky pixels.
+
+        Parameters
+        ----------
+        maps : (N_maps, N_pix)
+        fixed_pars : dict mapping map index → 'mono' or 'dip', optional.
+                     Fixes either the monopole or dipole of a given map.
+        use_prior : bool
+            If True, impose positivity constraints at the coldest pixels.
+            Solved via SLSQP. If False, solve the unconstrained normal
+            equations directly. Default False.
+        sigma_maps : (N_maps, N_pix) noise rms per pixel, optional.
+            Used to relax the positivity constraints by N·σ. Only used
+            when use_prior=True. If None, constraints are hard.
+        n_sigma : float
+            Constraint relaxation threshold in units of sigma. Only used
+            when use_prior=True and sigma_maps is not None. Default 4.
+        n_coldest : int
+            Maximum number of cold pixels per map to use as constraints.
+            Only used when use_prior=True. Default 50.
+        min_separation_deg : float
+            Minimum angular separation between cold pixels [degrees].
+            Only used when use_prior=True. Default 10.
+        iter : int, optional
+            Iteration number, used for saving slopes/intercepts to disk.
+        ext : str
+            Filename extension suffix for saving slopes/intercepts.
+        path_si : str, optional
+            Directory path for saving slopes/intercepts. If None, nothing
+            is saved.
+
+        Returns
+        -------
+        x : (n_params,) array of zero-level coefficients
+        """
         N_maps = len(maps)
-
-        # Monopole and Dipole Templates
         T_array = self.get_clusters_templates()
         n_temp = T_array.shape[-1]
 
-        assert self.n_clusters >= n_temp * N_maps, "Number of clusters must be larger than number of parameters to fit"
-        
-        # Calculate slopes (a) and intercepts (b)
+        assert self.n_clusters >= n_temp * N_maps, (
+            "Number of clusters must be larger than number of parameters to fit"
+        )
+
+        # ── Step 1: slopes and intercepts per cluster ────────────────────
         a = np.zeros((N_maps - 1, self.n_clusters))
         b = np.zeros((N_maps - 1, self.n_clusters))
 
@@ -288,39 +507,131 @@ class TTplots(MonoDip):
             s_cluster, i_cluster = self.calculate_slopes_intercepts(
                 maps[..., idx_cluster]
             )
-
             a[:, i] = s_cluster
             b[:, i] = i_cluster
 
         if path_si is not None:
-            np.save(f"{path_si}/slopes_iter{ext}_n{iter}.npy",  a)
-            np.save(f"{path_si}/intercepts_iter{ext}_n{iter}.npy",  b)
-        
+            np.save(f"{path_si}/slopes_iter{ext}_n{iter}.npy", a)
+            np.save(f"{path_si}/intercepts_iter{ext}_n{iter}.npy", b)
 
-
-        # Linear system A x = b
+        # ── Step 2: build linear system A x = b_vec ──────────────────────
         A = np.zeros(((N_maps - 1) * self.n_clusters, n_temp * N_maps))
         for i, a_m in enumerate(a):
-            A[i * self.n_clusters: (i + 1) * self.n_clusters, 
-                i * n_temp: (i + 2) * n_temp] = np.hstack([
-                    (- a_m * T_array.T).T, T_array])
-            
-        if self.calculate_dipole:
-            if fixed_pars is not None:
-                for idx, par in fixed_pars.items():
-                    if par == "mono":
-                        A = np.delete(A, idx * n_temp, axis=1)
-                    elif par == "dip":
-                        A = np.delete(A, np.arange(idx * n_temp + 1, (idx + 1) * n_temp), axis=1)
-                    else:
-                        raise ValueError(
-                            f'Either mono or dip is fixed for map[{idx}] not {par}'
-                            )
-        
-        b = np.ravel(b)[np.newaxis]
+            A[i * self.n_clusters: (i + 1) * self.n_clusters,
+              i * n_temp: (i + 2) * n_temp] = np.hstack([
+                (-a_m * T_array.T).T, T_array
+            ])
 
-        x = np.linalg.inv(A.T @ A) @ A.T @ b.T
-        return x[:, 0]
+        if self.calculate_dipole and fixed_pars is not None:
+            for idx, par in fixed_pars.items():
+                if par == "mono":
+                    A = np.delete(A, idx * n_temp, axis=1)
+                elif par == "dip":
+                    A = np.delete(
+                        A, np.arange(idx * n_temp + 1, (idx + 1) * n_temp), axis=1
+                    )
+                else:
+                    raise ValueError(
+                        f'Either mono or dip is fixed for map[{idx}] not {par}'
+                    )
+
+        b_vec = np.ravel(b)
+
+        # ── Step 3: unconstrained solve ───────────────────────────────────
+        x0 = (np.linalg.inv(A.T @ A) @ A.T @ b_vec[:, np.newaxis])[:, 0]
+
+        if not use_prior:
+            return x0
+
+        # ── Step 4: build positivity constraints ──────────────────────────
+        full_to_reduced, n_params_reduced = self._build_full_to_reduced_mapping(
+            N_maps, n_temp, fixed_pars
+        )
+
+        coldest_pixels = self._find_coldest_pixels(
+            maps, n_coldest=n_coldest, min_separation_deg=min_separation_deg
+        )
+
+        constraints = self._build_positivity_constraints(
+            maps=maps,
+            coldest_pixels_per_map=coldest_pixels,
+            n_temp=n_temp,
+            n_params_reduced=n_params_reduced,
+            full_to_reduced=full_to_reduced,
+            sigma_maps=sigma_maps,
+            n_sigma=n_sigma,
+        )
+
+
+        # Check how many constraints x0 already violates
+        n_violated = 0
+        for con in constraints:
+            if con["fun"](x0) < 0:
+                n_violated += 1
+        
+        if n_violated == 0:
+            print(f"[INFO] iter={iter}: unconstrained solution satisfies all "
+                  f"positivity constraints, skipping constrained solve.")
+            return x0
+        print(f"\t [INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
+              f"violated by unconstrained solution")
+
+
+        # ── Step 5: constrained QP solve via SLSQP ────────────────────────
+        AtA = A.T @ A
+        Atb = A.T @ b_vec
+
+        def objective(x):
+            r = A @ x - b_vec
+            return float(r @ r)
+
+        def gradient(x):
+            return 2.0 * (AtA @ x - Atb)
+
+        result = minimize(
+            fun=objective,
+            x0=x0,
+            jac=gradient,
+            method="SLSQP",
+            constraints=constraints,
+            options={"ftol": 1e-9, "maxiter": 1000, "disp": False,},
+        )
+
+        # Check how many constraints are violated by the result
+        n_violated = 0
+        violated_info = []
+        for j, con in enumerate(constraints):
+            val = con["fun"](result.x)
+            if val < 0:
+                n_violated += 1
+                violated_info.append((j, val))
+
+        if not result.success:
+            delta = np.max(np.abs(result.x - x0))
+
+            if n_violated == 0:
+                print(
+                    f"\t [INFO] Constrained solver nominally non-converged "
+                    f"(iter={iter}): {result.message}. "
+                    f"All constraints satisfied. "
+                    f"Max change from unconstrained solution: {delta:.3e}. "
+                )
+            else:
+                print(
+                    f"\t [WARNING] Constrained solver did not fully converge "
+                    f"(iter={iter}): {result.message}. "
+                    f"{n_violated}/{len(constraints)} constraints violated. "
+                    f"Max change from unconstrained solution: {delta:.3e}."
+                )
+                print(f"\t  Violated constraints (index, violation value):")
+                for j, val in violated_info:
+                    print(f"    constraint[{j}]: {val:.3e}")
+        else:
+            print(f"\t [INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
+                  f"violated by constrained solution")
+
+        return result.x
+
     
     def remove_zero_levels(self, maps: NDArray[np.float64], 
                            zero_levels: NDArray[np.float64],
@@ -359,13 +670,58 @@ class TTplots(MonoDip):
 
         return corrected_maps
     
-        
-    
 
-    def calculate_zero_levels_iter(self, maps: NDArray[np.float64], fixed_pars: Dict = None,
-                                   tolerance: float = 0.01, ext: str = "", path_si: str = None) -> NDArray[np.float64]:
-        
+    def calculate_zero_levels_iter(
+            self,
+            maps: NDArray[np.float64],
+            fixed_pars: Optional[Dict] = None,
+            tolerance: float = 0.01,
+            use_prior: bool = False,
+            sigma_maps: Optional[NDArray[np.float64]] = None,
+            n_sigma: float = 4.0,
+            n_coldest: int = 50,
+            min_separation_deg: float = 10.0,
+            ext: str = "",
+            path_si: str = None,
+            N_max_iter: int = 50,
+    ) -> NDArray[np.float64]:
+        """
+        Iteratively calculate zero levels (monopoles and optionally dipoles)
+        until convergence.
+
+        Parameters
+        ----------
+        maps : (N_maps, N_pix)
+        fixed_pars : dict mapping map index → 'mono' or 'dip', optional.
+        tolerance : float
+            Convergence criterion on the relative change in zero levels.
+            Default 0.01.
+        use_prior : bool
+            If True, impose the positivity prior at every iteration.
+            Default False.
+        sigma_maps : (N_maps, N_pix) noise rms per pixel, optional.
+            Used to relax positivity constraints by N·σ per pixel.
+            Only used when use_prior=True. If None, constraints are hard.
+        n_sigma : float
+            Constraint relaxation threshold in units of sigma. Default 4.
+        n_coldest : int
+            Maximum number of cold pixels per map used as constraints.
+            Only used when use_prior=True. Default 50.
+        min_separation_deg : float
+            Minimum angular separation between cold pixels [degrees].
+            Only used when use_prior=True. Default 10.
+        ext : str
+            Filename suffix for saving slopes/intercepts.
+        path_si : str, optional
+            Directory for saving slopes/intercepts. If None, nothing saved.
+
+        Returns
+        -------
+        total_zero_levels : (n_params,) cumulative zero levels
+        zero_levels_list : (n_iter, n_params) zero levels at each iteration
+        """
         N_maps = len(maps)
+        print(f'N_max_iter={N_max_iter}, tolerance={tolerance}, use_prior={use_prior}, ')
 
         if self.calculate_dipole:
             n_fixed_pars = 0
@@ -378,42 +734,56 @@ class TTplots(MonoDip):
                     else:
                         raise ValueError(
                             f'Either mono or dip is fixed for map[{idx}] not {par}'
-                            )
-        
+                        )
             total_zero_levels = np.zeros(4 * N_maps - n_fixed_pars)
             zero_levels_list = [np.zeros(4 * N_maps - n_fixed_pars)]
         else:
-            assert fixed_pars is None, "Fixing dipole is not available if calculate_dipole is False"
-            total_zero_levels = np.zeros( N_maps)
-            zero_levels_list = [np.zeros( N_maps)]
-            
+            assert fixed_pars is None, (
+                "Fixing dipole is not available if calculate_dipole is False"
+            )
+            total_zero_levels = np.zeros(N_maps)
+            zero_levels_list = [np.zeros(N_maps)]
+
         criterion = 1
         iter = 0
-        while criterion > tolerance:
+        while criterion > tolerance and iter <= N_max_iter:
             iter_mono_dipole = self.calculate_mono_dipole(
-                maps, fixed_pars=fixed_pars, iter=iter, ext=ext, path_si=path_si)
+                maps,
+                fixed_pars=fixed_pars,
+                use_prior=use_prior,
+                sigma_maps=sigma_maps,
+                n_sigma=n_sigma,
+                n_coldest=n_coldest,
+                min_separation_deg=min_separation_deg,
+                iter=iter,
+                ext=ext,
+                path_si=path_si,
+            )
             zero_levels_list.append(iter_mono_dipole)
-
             total_zero_levels += iter_mono_dipole
 
             maps = self.remove_zero_levels(maps, iter_mono_dipole, fixed_pars=fixed_pars)
 
             criterion = np.sum(
-                np.abs(zero_levels_list[-1] - zero_levels_list[-2]).sum() 
+                np.abs(zero_levels_list[-1] - zero_levels_list[-2]).sum()
                 / np.max([np.abs(total_zero_levels).sum(), 1e-7])
             )
             iter += 1
             print(f"{iter = }: {criterion = }")
+        if iter > N_max_iter:
+            print(f"[WARNING] Reached maximum iterations ({N_max_iter}) without "
+                  f"convergence (criterion={criterion:.3e} > tolerance={tolerance:.3e}).")
         return total_zero_levels, np.array(zero_levels_list[1:])
-    
 
 
 class TemplateFitting(MonoDip):
 
-    def __init__(self, nside: int, mask: NDArray[np.float64] = None) -> None:
+    def __init__(self, nside: int, mask: NDArray[np.float64] = None,
+                 calculate_dipole: bool = True) -> None:
 
-        super().__init__(nside, mask=mask)
-
+        super().__init__(
+            nside, mask=mask, calculate_dipole=calculate_dipole
+        )
 
     def template_fitting(self, m: NDArray[np.float64], sigma: NDArray[np.float64],
                          template_maps: NDArray[np.float64],
