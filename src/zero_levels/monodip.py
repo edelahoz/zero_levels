@@ -2,11 +2,11 @@
 
 import numpy as np
 import healpy as hp
+import logging
 
 from scipy.optimize import minimize
 from typing import List, Union, Dict, Optional
 from numpy.typing import NDArray
-
 
 class MonoDip():
 
@@ -113,7 +113,10 @@ class TTplots(MonoDip):
     def __init__(self, nside: int, nside_cluster: int = None,
                  clusters: List[NDArray[np.int32]] = None, 
                  mask: NDArray = None, 
-                 calculate_dipole: bool = True) -> None:
+                 calculate_dipole: bool = True,
+                 log_file: Optional[str] = None,
+                 mask_name: Optional[str] = None,
+        ) -> None:
 
         super().__init__(
             nside, mask=mask, calculate_dipole=calculate_dipole
@@ -129,6 +132,33 @@ class TTplots(MonoDip):
         self.n_clusters = len(clusters)
         self.clusters = clusters
         self.T_array_clusters = None
+
+        # --- Set up Logging ---
+        self.logger = logging.getLogger(f"{__name__}.TTplots")
+        self.logger.setLevel(logging.INFO)
+         
+         # Prevent adding multiple handlers if the class is instantiated multiple times
+        if not self.logger.handlers:
+            if log_file:
+                # Log to the specified file
+                handler = logging.FileHandler(log_file, mode='w')
+            else:
+                # Log to console by default
+                handler = logging.StreamHandler()
+                
+            handler.setFormatter(logging.Formatter('%(message)s'))
+            self.logger.addHandler(handler)
+
+        if mask_name is not None:
+            mask_str = f"mask: {mask_name}"
+        else:
+            mask_str
+        self.logger.info(f"Initialized: \n"
+                         f"\t Nside={nside} \n"
+                         f"\t Nside_cluster={nside_cluster} \n" 
+                         f"\t {mask_str} \n"
+                         "\t Monopole + Dipole \n" if calculate_dipole else "\t Monopole \n"
+                         )
         
 
     @staticmethod
@@ -574,11 +604,11 @@ class TTplots(MonoDip):
                 n_violated += 1
         
         if n_violated == 0:
-            print("\t" + f"[INFO] iter={iter}: unconstrained solution satisfies all "
-                  f"positivity constraints, skipping constrained solve.")
+            self.logger.info("\t" + f"[INFO] Unconstrained solution satisfies all \n"
+                             "\t" + f"positivity constraints, skipping constrained solve.")
             return x0
-        print("\t" + f"[INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
-              f"violated by unconstrained solution")
+        self.logger.info("\t" + f"[INFO] {n_violated}/{len(constraints)} constraints "
+                         f"violated by unconstrained solution")
 
 
         # ── Step 5: constrained QP solve via SLSQP ────────────────────────
@@ -617,26 +647,26 @@ class TTplots(MonoDip):
             delta = np.max(np.abs(result.x - x0))
 
             if n_violated == 0:
-                print(
-                    "\t" + f"[INFO] Constrained solver nominally non-converged "
-                    f"(iter={iter}): {result.message}. "
-                    f"All constraints satisfied. "
-                    f"Max change from unconstrained solution: {delta:.3e}. "
+                self.logger.info(
+                    "\t" + f"[INFO] Constrained solver did not fully converge: "
+                    f"{result.message}. "
+                    f"All constraints satisfied "
+                    f"Max change from unconstrained solution: {delta:.3e} "
                 )
             else:
-                print(
-                    "\t" + f"[WARNING] Constrained solver did not fully converge "
-                    f"(iter={iter}): {result.message}. "
+                self.logger.warning(
+                    "\t" + f"[WARNING] Constrained solver did not fully converge: "
+                    f"{result.message}. "
                     f"{n_violated}/{len(constraints)} constraints violated. "
                     f"Max change from unconstrained solution: {delta:.3e}."
                 )
-                print("\t" + f"Violated constraints (index, violation value):")
+                self.logger.warning("\t" + f"Violated constraints (index, violation value):")
                 for j, val in violated_info:
-                    print(f"    constraint[{j}]: {val:.3e}")
+                    self.logger.warning(f"    constraint[{j}]: {val:.3e}")
         else:
-            print("\t" + '[INFO] SUCCESS')
-            print("\t" + f"[INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
-                  f"violated by constrained solution")
+            self.logger.info("\t" + '[INFO] Constrained solver converged.')
+            self.logger.info("\t" + f"[INFO] {n_violated}/{len(constraints)} constraints "
+                  f"violated by constrained solution.")
 
         return result.x
 
@@ -693,6 +723,7 @@ class TTplots(MonoDip):
             path_si: str = None,
             N_max_iter: int = 50,
             coldest_pixels: Optional[List] = None,
+            case_name: Optional[str] = None,
     ) -> NDArray[np.float64]:
         """
         Iteratively calculate zero levels (monopoles and optionally dipoles)
@@ -729,6 +760,10 @@ class TTplots(MonoDip):
         total_zero_levels : (n_params,) cumulative zero levels
         zero_levels_list : (n_iter, n_params) zero levels at each iteration
         """
+        if case_name is not None:
+            self.logger.info(60 * "-")
+            self.logger.info(f"Running: {case_name}...")
+            self.logger.info(60 * "-")
         N_maps = len(maps)
 
         if self.calculate_dipole:
@@ -755,7 +790,7 @@ class TTplots(MonoDip):
         criterion = 1
         iter = 0
         while criterion > tolerance and iter <= N_max_iter:
-            print("\t" + 10 * '*' + f"   ITER: {iter}   " + 10 * '*')
+            self.logger.info("\t" + 10 * '*' + f"   ITER: {iter}   " + 10 * '*')
             iter_mono_dipole = self.calculate_mono_dipole(
                 maps,
                 fixed_pars=fixed_pars,
@@ -779,11 +814,12 @@ class TTplots(MonoDip):
                 / np.max([np.abs(total_zero_levels).sum(), 1e-7])
             )
             
-            print("\t" + f"[INFO] {iter = }: {criterion = }")
+            self.logger.info("\t" + f"[INFO] {criterion = }")
             iter += 1
         if iter > N_max_iter:
-            print("\t" + f"[WARNING] Reached maximum iterations ({N_max_iter}) without "
+            self.logger.warning("\t" + f"[WARNING] Reached maximum iterations ({N_max_iter}) without \n"
                   f"convergence (criterion={criterion:.3e} > tolerance={tolerance:.3e}).")
+        self.logger.info("\n")
         return total_zero_levels, np.array(zero_levels_list[1:])
 
 
