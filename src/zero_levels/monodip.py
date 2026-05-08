@@ -263,11 +263,10 @@ class TTplots(MonoDip):
             self.T_array_clusters = T_array_clusters
         return self.T_array_clusters
 
-
     def _find_coldest_pixels(
             self,
             maps: NDArray[np.float64],
-            n_coldest: int = 50,
+            n_coldest: int | None = None,
             min_separation_deg: float = 10.0,
     ) -> List[NDArray[np.int32]]:
         """
@@ -305,7 +304,7 @@ class TTplots(MonoDip):
             vecs_selected = []
 
             for pix in sorted_pixels:
-                if len(selected) >= n_coldest:
+                if (n_coldest is not None) and (len(selected) >= n_coldest):
                     break
 
                 vec = np.array(hp.pix2vec(self.nside, int(pix)))
@@ -448,10 +447,12 @@ class TTplots(MonoDip):
             sigma_maps: Optional[NDArray[np.float64]] = None,
             n_sigma: float = 4.0,
             n_coldest: int = 50,
+            ftol: float = 1e-6,
             min_separation_deg: float = 10.0,
             iter: int = None,
             ext: str = "",
             path_si: str = None,
+            coldest_pixels: Optional[List] = None,
     ) -> NDArray[np.float64]:
         """
         Calculate monopole (and optionally dipole) zero levels using the
@@ -475,7 +476,7 @@ class TTplots(MonoDip):
             when use_prior=True and sigma_maps is not None. Default 4.
         n_coldest : int
             Maximum number of cold pixels per map to use as constraints.
-            Only used when use_prior=True. Default 50.
+            Only used when use_prior=True and coldest_pixels is None. Default 50.
         min_separation_deg : float
             Minimum angular separation between cold pixels [degrees].
             Only used when use_prior=True. Default 10.
@@ -486,7 +487,8 @@ class TTplots(MonoDip):
         path_si : str, optional
             Directory path for saving slopes/intercepts. If None, nothing
             is saved.
-
+        coldest_pixels: List, optional
+            Coldest pixels for map combination.
         Returns
         -------
         x : (n_params,) array of zero-level coefficients
@@ -538,7 +540,8 @@ class TTplots(MonoDip):
         b_vec = np.ravel(b)
 
         # ── Step 3: unconstrained solve ───────────────────────────────────
-        x0 = (np.linalg.inv(A.T @ A) @ A.T @ b_vec[:, np.newaxis])[:, 0]
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            x0 = (np.linalg.inv(A.T @ A) @ A.T @ b_vec[:, np.newaxis])[:, 0]
 
         if not use_prior:
             return x0
@@ -548,9 +551,10 @@ class TTplots(MonoDip):
             N_maps, n_temp, fixed_pars
         )
 
-        coldest_pixels = self._find_coldest_pixels(
-            maps, n_coldest=n_coldest, min_separation_deg=min_separation_deg
-        )
+        if coldest_pixels is None:
+            coldest_pixels = self._find_coldest_pixels(
+                maps, n_coldest=n_coldest, min_separation_deg=min_separation_deg
+            )
 
         constraints = self._build_positivity_constraints(
             maps=maps,
@@ -570,20 +574,23 @@ class TTplots(MonoDip):
                 n_violated += 1
         
         if n_violated == 0:
-            print(f"[INFO] iter={iter}: unconstrained solution satisfies all "
+            print("\t" + f"[INFO] iter={iter}: unconstrained solution satisfies all "
                   f"positivity constraints, skipping constrained solve.")
             return x0
-        print(f"\t [INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
+        print("\t" + f"[INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
               f"violated by unconstrained solution")
 
 
         # ── Step 5: constrained QP solve via SLSQP ────────────────────────
-        AtA = A.T @ A
-        Atb = A.T @ b_vec
+        with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+            AtA = A.T @ A
+            Atb = A.T @ b_vec
 
         def objective(x):
-            r = A @ x - b_vec
-            return float(r @ r)
+            with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+                r = A @ x - b_vec
+                val = float(r @ r)
+            return val
 
         def gradient(x):
             return 2.0 * (AtA @ x - Atb)
@@ -594,7 +601,7 @@ class TTplots(MonoDip):
             jac=gradient,
             method="SLSQP",
             constraints=constraints,
-            options={"ftol": 1e-9, "maxiter": 1000, "disp": False,},
+            options={"ftol": ftol, "maxiter": 1000, "disp": False,},
         )
 
         # Check how many constraints are violated by the result
@@ -611,23 +618,24 @@ class TTplots(MonoDip):
 
             if n_violated == 0:
                 print(
-                    f"\t [INFO] Constrained solver nominally non-converged "
+                    "\t" + f"[INFO] Constrained solver nominally non-converged "
                     f"(iter={iter}): {result.message}. "
                     f"All constraints satisfied. "
                     f"Max change from unconstrained solution: {delta:.3e}. "
                 )
             else:
                 print(
-                    f"\t [WARNING] Constrained solver did not fully converge "
+                    "\t" + f"[WARNING] Constrained solver did not fully converge "
                     f"(iter={iter}): {result.message}. "
                     f"{n_violated}/{len(constraints)} constraints violated. "
                     f"Max change from unconstrained solution: {delta:.3e}."
                 )
-                print(f"\t  Violated constraints (index, violation value):")
+                print("\t" + f"Violated constraints (index, violation value):")
                 for j, val in violated_info:
                     print(f"    constraint[{j}]: {val:.3e}")
         else:
-            print(f"\t [INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
+            print("\t" + '[INFO] SUCCESS')
+            print("\t" + f"[INFO] iter={iter}: {n_violated}/{len(constraints)} constraints "
                   f"violated by constrained solution")
 
         return result.x
@@ -684,6 +692,7 @@ class TTplots(MonoDip):
             ext: str = "",
             path_si: str = None,
             N_max_iter: int = 50,
+            coldest_pixels: Optional[List] = None,
     ) -> NDArray[np.float64]:
         """
         Iteratively calculate zero levels (monopoles and optionally dipoles)
@@ -721,7 +730,6 @@ class TTplots(MonoDip):
         zero_levels_list : (n_iter, n_params) zero levels at each iteration
         """
         N_maps = len(maps)
-        print(f'N_max_iter={N_max_iter}, tolerance={tolerance}, use_prior={use_prior}, ')
 
         if self.calculate_dipole:
             n_fixed_pars = 0
@@ -747,6 +755,7 @@ class TTplots(MonoDip):
         criterion = 1
         iter = 0
         while criterion > tolerance and iter <= N_max_iter:
+            print("\t" + 10 * '*' + f"   ITER: {iter}   " + 10 * '*')
             iter_mono_dipole = self.calculate_mono_dipole(
                 maps,
                 fixed_pars=fixed_pars,
@@ -758,6 +767,7 @@ class TTplots(MonoDip):
                 iter=iter,
                 ext=ext,
                 path_si=path_si,
+                coldest_pixels=coldest_pixels,
             )
             zero_levels_list.append(iter_mono_dipole)
             total_zero_levels += iter_mono_dipole
@@ -768,10 +778,11 @@ class TTplots(MonoDip):
                 np.abs(zero_levels_list[-1] - zero_levels_list[-2]).sum()
                 / np.max([np.abs(total_zero_levels).sum(), 1e-7])
             )
+            
+            print("\t" + f"[INFO] {iter = }: {criterion = }")
             iter += 1
-            print(f"{iter = }: {criterion = }")
         if iter > N_max_iter:
-            print(f"[WARNING] Reached maximum iterations ({N_max_iter}) without "
+            print("\t" + f"[WARNING] Reached maximum iterations ({N_max_iter}) without "
                   f"convergence (criterion={criterion:.3e} > tolerance={tolerance:.3e}).")
         return total_zero_levels, np.array(zero_levels_list[1:])
 
