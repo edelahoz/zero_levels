@@ -114,6 +114,7 @@ class TTplots(MonoDip):
                  clusters: List[NDArray[np.int32]] = None, 
                  mask: NDArray = None, 
                  calculate_dipole: bool = True,
+                 min_pix_per_cluster: float = 2,
                  log_file: Optional[str] = None,
                  mask_name: Optional[str] = None,
         ) -> None:
@@ -128,7 +129,7 @@ class TTplots(MonoDip):
             else:
                 clusters = self.get_HEALPix_super_clusters(nside, nside_cluster, mask=mask)
 
-        clusters = [cluster for cluster in clusters if cluster.size > 1]
+        clusters = [cluster for cluster in clusters if cluster.size >= min_pix_per_cluster]
         self.n_clusters = len(clusters)
         self.clusters = clusters
         self.T_array_clusters = None
@@ -158,6 +159,7 @@ class TTplots(MonoDip):
                          f"\t Nside_cluster={nside_cluster} \n" 
                          f"\t {mask_str} \n"
                          "\t Monopole + Dipole \n" if calculate_dipole else "\t Monopole \n"
+                         f"\t Min pix per cluster {min_pix_per_cluster} \n"
                          )
         
 
