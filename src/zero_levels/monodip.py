@@ -469,6 +469,17 @@ class TTplots(MonoDip):
         full_to_reduced = {full: red for red, full in enumerate(kept_cols)}
 
         return full_to_reduced, n_params_reduced
+    
+    @staticmethod
+    def _parse_slope_limits(limits, default_val, N_pairs):
+        if limits is None:
+            return np.full(N_pairs, default_val)
+        if np.isscalar(limits):
+            return np.full(N_pairs, limits)
+        if len(limits) == N_pairs:
+            # Convert list to array, replacing any inner None with default_val
+            return np.array([val if val is not None else default_val for val in limits])
+        raise ValueError(f"Slope limit must be None, a scalar, or have exactly {N_pairs} elements.")
 
 
     def calculate_mono_dipole(
@@ -485,6 +496,8 @@ class TTplots(MonoDip):
             ext: str = "",
             path_si: str = None,
             coldest_pixels: Optional[List] = None,
+            min_slope: Optional[float] = None,
+            max_slope: Optional[float] = None,
     ) -> NDArray[np.float64]:
         """
         Calculate monopole (and optionally dipole) zero levels using the
@@ -521,6 +534,12 @@ class TTplots(MonoDip):
             is saved.
         coldest_pixels: List, optional
             Coldest pixels for map combination.
+        min_slope : float, list, or None, optional
+            Minimum allowed slope(s) to retain a cluster. 
+            Can be None (no limits), a scalar, or list of length N_maps - 1.
+        max_slope : float, list, or None, optional
+            Maximum allowed slope(s) to retain a cluster. 
+            Can be None (no limits), a scalar, or list of length N_maps - 1.
         Returns
         -------
         x : (n_params,) array of zero-level coefficients
@@ -543,6 +562,36 @@ class TTplots(MonoDip):
             )
             a[:, i] = s_cluster
             b[:, i] = i_cluster
+        
+        # ── Filter clusters by allowed slope ranges  ───────────────
+        min_slopes_arr = self._parse_slope_limits(min_slope, -np.inf, N_maps - 1)
+        max_slopes_arr = self._parse_slope_limits(max_slope, np.inf, N_maps - 1)
+
+        valid_cluster_mask = (a >= min_slopes_arr[:, None]) & (a <= max_slopes_arr[:, None])
+        valid_cluster_mask = np.all(valid_cluster_mask, axis=0)
+        
+        # Logging removed clusters
+        num_removed = np.sum(~valid_cluster_mask)
+        if num_removed > 0:
+            removed_indices = np.where(~valid_cluster_mask)[0]
+            
+            self.logger.info("\t" + f"[INFO] Filtered out {num_removed} clusters due to slope range limits.")
+            self.logger.info(f"Removed cluster indices: {removed_indices.tolist()}")
+        else:
+            self.logger.info("\t" + f"[INFO] No clusters removed by slope limits.")
+
+        # Apply the mask to keep only valid clusters
+        a = a[:, valid_cluster_mask]
+        b = b[:, valid_cluster_mask]
+        
+        valid_clusters_list = [self.clusters[idx] for idx in range(self.n_clusters) if valid_cluster_mask[idx]]
+        self.clusters = valid_clusters_list
+        self.n_clusters = len(self.clusters)
+        
+        T_array = T_array[valid_cluster_mask]
+        if self.T_array_clusters is not None:
+            self.T_array_clusters = self.T_array_clusters[valid_cluster_mask]
+
 
         if path_si is not None:
             np.save(f"{path_si}/slopes_iter{ext}_n{iter}.npy", a)
@@ -631,9 +680,9 @@ class TTplots(MonoDip):
             fun=objective,
             x0=x0,
             jac=gradient,
-            method="SLSQP",
+            method="trust-constr",
             constraints=constraints,
-            options={"ftol": ftol, "maxiter": 1000, "disp": False,},
+            options={"gtol": ftol, "maxiter": 1000, "disp": False,},
         )
 
         # Check how many constraints are violated by the result
@@ -726,6 +775,8 @@ class TTplots(MonoDip):
             N_max_iter: int = 50,
             coldest_pixels: Optional[List] = None,
             case_name: Optional[str] = None,
+            min_slope: Optional[float] = None,
+            max_slope: Optional[float] = None,
     ) -> NDArray[np.float64]:
         """
         Iteratively calculate zero levels (monopoles and optionally dipoles)
@@ -756,6 +807,12 @@ class TTplots(MonoDip):
             Filename suffix for saving slopes/intercepts.
         path_si : str, optional
             Directory for saving slopes/intercepts. If None, nothing saved.
+        min_slope : float, list, or None, optional
+            Minimum allowed slope(s) to retain a cluster. 
+            Can be None (no limits), a scalar, or list of length N_maps - 1.
+        max_slope : float, list, or None, optional
+            Maximum allowed slope(s) to retain a cluster. 
+            Can be None (no limits), a scalar, or list of length N_maps - 1.
 
         Returns
         -------
@@ -805,6 +862,8 @@ class TTplots(MonoDip):
                 ext=ext,
                 path_si=path_si,
                 coldest_pixels=coldest_pixels,
+                min_slope=min_slope,
+                max_slope=max_slope,
             )
             zero_levels_list.append(iter_mono_dipole)
             total_zero_levels += iter_mono_dipole
