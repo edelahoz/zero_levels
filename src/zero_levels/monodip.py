@@ -902,3 +902,112 @@ class TemplateFitting(MonoDip):
 
         z = np.linalg.inv((T_array.T / (sigma ** 2)) @ T_array) @ T_array.T @ ( m / (sigma ** 2)) [..., np.newaxis]
         return z
+
+
+import numpy as np
+import healpy as hp
+from typing import Optional
+from numpy.typing import NDArray
+
+class CosecantFit(MonoDip):
+    def __init__(self, nside: int, 
+                 mask: Optional[NDArray] = None, 
+                 calculate_dipole: bool = False) -> None:
+        if calculate_dipole:
+            raise NotImplementedError(
+                "Dipole fitting is not supported for the Cosecant method. "
+                "Please initialize with calculate_dipole=False."
+            )
+            
+        super().__init__(nside, mask=mask, calculate_dipole=calculate_dipole)
+
+    def _get_cosecant_template(self) -> NDArray[np.float64]:
+        """Generates a csc(|b|) template for the sky."""
+        npix = hp.nside2npix(self.nside)
+        theta, _ = hp.pix2ang(self.nside, np.arange(npix))
+        
+        # Convert colatitude (theta) to galactic latitude (b)
+        b = np.pi / 2.0 - theta
+        
+        sin_b = np.abs(np.sin(b))
+        sin_b[sin_b < 1e-5] = 1e-5  # Regularize to prevent division by zero at the galactic plane
+        
+        return 1.0 / sin_b
+
+    def calculate_mono(
+            self, 
+            maps: NDArray[np.float64], 
+            sigma_maps: Optional[NDArray[np.float64]] = None, 
+            **_) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """
+        Fits the cosecant model to find the zero level (monopole) and its uncertainty.
+        
+        Parameters:
+            maps: Array of maps to fit, shape (N_maps, N_pix)
+            sigma_maps: Array of sigma maps to perform a noise-weighted fit, shape (N_maps, N_pix)
+                      
+            
+        Returns:
+            tuple: (monopoles, uncertainties)
+                - monopoles: 1D array of length N_maps with the computed zero levels.
+                - uncertainties: 1D array of length N_maps with the 1-sigma errors on the zero levels.
+        """
+        csc_template = self._get_cosecant_template()
+        
+        if self.mask is not None:
+            valid_pixels = self.mask > 0
+        else:
+            valid_pixels = np.ones(hp.nside2npix(self.nside), dtype=bool)
+
+        # column 0 is csc(|b|), column 1 is a constant (1.0)
+        x_csc = csc_template[valid_pixels]
+        X = np.vstack([x_csc, np.ones_like(x_csc)]).T
+        
+        results_monopole = np.zeros(maps.shape[0])
+        results_uncertainty = np.zeros(maps.shape[0])
+
+        for i, m in enumerate(maps):
+            y = m[valid_pixels]
+            
+            if sigma_maps is not None:
+                # Weighted Least Squares (WLS)
+                sigma = sigma_maps[i][valid_pixels]
+                
+                w = 1.0 / (sigma ** 2 + 1e-20) # Add small epsilon to prevent division by zero
+                
+                XT_W_X = (X.T * w) @ X
+                XT_W_y = (X.T * w) @ y
+                
+                # Covariance matrix is the inverse of (X^T * W * X)
+                cov = np.linalg.inv(XT_W_X)
+                
+                # Parameters beta = [Amplitude, Monopole]
+                beta = cov @ XT_W_y
+                
+                results_monopole[i] = beta[1]
+                results_uncertainty[i] = np.sqrt(cov[1, 1])
+                
+            else:
+                # Ordinary Least Squares (OLS)
+                beta, residuals, _, _ = np.linalg.lstsq(X, y, rcond=None)
+                results_monopole[i] = beta[1]
+                
+                # Estimate parameter uncertainty from the data variance
+                if residuals.size > 0:
+                    rss = residuals[0]
+                else:
+                    # Fallback if lstsq doesn't return residuals
+                    y_pred = X @ beta
+                    rss = np.sum((y - y_pred) ** 2)
+                
+                # Degrees of freedom: N_data_points - N_parameters (which is 2)
+                dof = len(y) - 2
+                reduced_chi2 = rss / dof
+                
+                # Covariance matrix = reduced_chi2 * (X^T * X)^-1
+                XT_X_inv = np.linalg.inv(X.T @ X)
+                cov = reduced_chi2 * XT_X_inv
+                
+                results_uncertainty[i] = np.sqrt(cov[1, 1])
+            
+        return results_monopole, results_uncertainty
